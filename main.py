@@ -1,16 +1,7 @@
-import asyncio
 import inspect
-import logging
-import random
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
 from functools import update_wrapper
 from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, overload
-from pathlib import Path
-
-import numpy as np
-from llama_cpp import Llama
-from pydantic import BaseModel
 
 from magentic.backend import get_chat_model
 from magentic.chat_model.base import ChatModel
@@ -28,12 +19,14 @@ from magentic.function_call import (
     ParallelFunctionCall,
 )
 from magentic.logger import logger
-from magentic.prompt_function import (
-    BasePromptFunction,
-    AsyncPromptFunction,
-    PromptFunction,
-)
+from magentic.prompt_function import BasePromptFunction, AsyncPromptFunction, PromptFunction
 from magentic.streaming import async_iter, azip
+
+import random
+import re
+import numpy as np
+from pydantic import BaseModel
+from llama_cpp import Llama
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -52,7 +45,7 @@ class LLMCall(Generic[P, R]):
         output_type: type[R] | None = None,
         format_variables: dict[str, Any] | None = None,
         template_modifiers: list[Callable[[str], str]] | None = None,
-        llama_intention: "LlamaIntention" | None = None,  # Add this to class
+        llama_intention: "LlamaIntention" | None = None, # Add this to class
     ):
         self.template = template
         self.functions = functions or []
@@ -72,17 +65,12 @@ class LLMCall(Generic[P, R]):
     def _get_prompt_function(self) -> PromptFunction[P, R]:
         """Create a PromptFunction using the `prompt` decorator."""
         return prompt(
-            self.template,
-            functions=self.functions,
-            model=self.model,
-            output_type=self.output_type,
+            self.template, functions=self.functions, model=self.model, output_type=self.output_type
         )
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> "LLMCall[P, R]":
         """Call the LLM with the formatted prompt and arguments."""
-        logger.info(
-            f"Entering __call__ for template: {self.template}, version: {self.version}"
-        )
+        logger.info(f"Entering __call__ for template: {self.template}, version: {self.version}")
         self.format_variables.update(kwargs)
 
         formatted_template = self.template.format(**self.format_variables)
@@ -110,9 +98,15 @@ class LLMCall(Generic[P, R]):
             # Subtraction: Return first parent's output for now
             self.output = self._parents[0].execute()
         elif self._op == "/":
-            # Division: Implement your logic here
-            # For now, just return the first parent's output as a placeholder
-            self.output = self._parents[0].execute()
+            # Division: Use LlamaIntention to filter concepts
+            if len(self._parents) == 2 and isinstance(self._parents[0].output, str) and isinstance(self._parents[1].output, list):
+                if self.llama_intention:
+                    self.output = self.llama_intention.filter_text_by_concepts(self._parents[0].execute(), self._parents[1].execute())
+                else:
+                    logger.warning("LlamaIntention instance not provided. Division operation will return the first parent's output.")
+                    self.output = self._parents[0].execute()
+            else:
+                raise ValueError("Division operation not defined for current output types or requires LlamaIntention.")
         else:
             return self.output
 
@@ -137,6 +131,7 @@ class LLMCall(Generic[P, R]):
             model=self.model,
             output_type=self.output_type,
             format_variables=self.format_variables,
+            llama_intention=self.llama_intention
         )
         combined._parents = [self, other]
         combined._op = op
@@ -146,11 +141,6 @@ class LLMCall(Generic[P, R]):
             other._children.append(combined)
 
         return combined
-
-    def _filter_text_by_concepts(self, text: str, concepts: List[str]) -> str:
-        """Placeholder for filtering text based on concepts."""
-        # Implement your logic here
-        return text
 
     def update_template(self, new_template: str):
         """Updates the template and increments the version."""
@@ -177,9 +167,7 @@ class LLMCall(Generic[P, R]):
 
     def backward(self, error_signal: Any = None):
         """Backpropagation logic to adjust based on error signals."""
-        logger.info(
-            f"Backpropagating through {self._op} operation, error_signal: {error_signal}"
-        )
+        logger.info(f"Backpropagating through {self._op} operation, error_signal: {error_signal}")
 
         if error_signal is None:
             error_signal = self.evaluate_output()
@@ -188,15 +176,9 @@ class LLMCall(Generic[P, R]):
             if self._op == "+":
                 if error_signal > 0.5:
                     # Re-execute the prompt with an updated template
-                    self.update_template(
-                        self.template + " Be more concise and factual."
-                    )
-                    self.output = self._get_prompt_function()(
-                        **self.format_variables
-                    )
-                    logger.info(
-                        f"Re-executed prompt with updated template. New output: {self.output}"
-                    )
+                    self.update_template(self.template + " Be more concise and factual.")
+                    self.output = self._get_prompt_function()(**self.format_variables)
+                    logger.info(f"Re-executed prompt with updated template. New output: {self.output}")
 
             elif self._op == "/":
                 if error_signal > 0.5:
@@ -204,20 +186,12 @@ class LLMCall(Generic[P, R]):
                         numerator_output = self._parents[0].execute()
                         denominator_output = self._parents[1].execute()
 
-                        if isinstance(numerator_output, str) and isinstance(
-                            denominator_output, list
-                        ):
-                            filtered_output = self._filter_text_by_concepts(
-                                numerator_output, denominator_output
-                            )
+                        if isinstance(numerator_output, str) and isinstance(denominator_output, list):
+                            filtered_output = self._filter_text_by_concepts(numerator_output, denominator_output)
                             self.output = filtered_output
-                            logger.info(
-                                f"Filtered output based on concepts. New output: {self.output}"
-                            )
+                            logger.info(f"Filtered output based on concepts. New output: {self.output}")
                         else:
-                            logger.warning(
-                                "Division operation not defined for current output types."
-                            )
+                            logger.warning("Division operation not defined for current output types.")
 
         # Propagate the error signal to parent nodes
         for parent in self._parents:
@@ -271,7 +245,7 @@ class TemplateModifier:
             raise ValueError(f"Unknown modification type: {modification_type}")
 
 class LlamaIntention:
-    def __init__(self, llm_model: Any):  # Replace 'Any' with the actual type of your language model
+    def __init__(self, llm_model: Any):  # Replace 'Any' with your LLM model type
         self.llm = llm_model
 
     def format_prompt(self, text: str) -> str:
@@ -279,8 +253,7 @@ class LlamaIntention:
         return f"Analyze the following text: {text}"
 
     def get_target_token_id(self) -> int:
-        # Placeholder: Replace with your model's specific way of getting token IDs
-        return 0  # Example: using 0 as a placeholder for an unknown token
+        return self.llm.tokenize(b" ")[0]
 
     def get_logprobs(self, text: str) -> np.ndarray:
         prompt = self.format_prompt(text)
@@ -298,12 +271,12 @@ class LlamaIntention:
 
     def calculate_error_signal(self, logprobs: np.ndarray) -> float:
         """Calculates an error signal based on log probabilities."""
-        # Placeholder: Implement your logic for error signal calculation
+        # This is a placeholder. Replace with your actual error calculation logic.
         return np.std(logprobs)
 
     def analyze_logprobs(self, text: str, logprobs: np.ndarray) -> Any:
         """Analyzes log probabilities to determine the outcome of the intention."""
-        # Placeholder: Implement your logic for analyzing log probabilities
+        # Placeholder for more sophisticated analysis
         avg_logprob = np.mean(logprobs)
         boundaries = [i for i, lp in enumerate(logprobs) if lp < avg_logprob - 0.5]
         return boundaries
@@ -318,10 +291,19 @@ class LlamaIntention:
     def handle_empty_input(self) -> Any:
         return None
 
+    def filter_text_by_concepts(self, text: str, concepts: List[str]) -> str:
+        """Filters text based on the presence of given concepts."""
+        filtered_text = []
+        sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', text)
+        for sentence in sentences:
+            if any(concept.lower() in sentence.lower() for concept in concepts):
+                filtered_text.append(sentence)
+        return " ".join(filtered_text)
+
 async def main():
     # Initialize the LLM
     llm = Llama(
-        model_path="/path/to/model.gguf", # Add path to model
+        model_path="/path/to/your/model.gguf", # Add path to model
         n_ctx=8192,
         n_gpu_layers=17,
         seed=42,
@@ -336,16 +318,17 @@ async def main():
     llm_call3 = LLMCall("What is the sentiment of this text: {text}?", llama_intention=llama_intention)
 
     # Combine LLM calls using arithmetic operators
-    combined_call = (llm_call1 + llm_call2) * llm_call3
+    # The division operator is used to filter the output of llm_call1 based on concepts from llm_call3
+    combined_call = (llm_call1 + llm_call2) / llm_call3
 
     # Initial input
-    input_text = "This is a test."
+    input_text = "This is a test. The weather is nice. The quick brown fox jumps over the lazy dog."
 
     # Create a template modifier
     modifier = TemplateModifier(llm_call1.template)
 
     # Main loop
-    for iteration in range(10):  # Increased number of iterations
+    for iteration in range(3):  # Increased number of iterations
         print(f"Iteration {iteration + 1}")
 
         # Execute the combined call with specific inputs
