@@ -56,9 +56,9 @@ class LLMCall(Generic[P, R]):
         self.model = model or get_chat_model()
         self.output_type = output_type or str
         self.format_variables = format_variables or {}
-        self.output: str | None = None
-        self.input: str | None = None
-        self.error_signal: float | None = None
+        self.output: str | None = None  # Store the output of the LLM call
+        self.input: str | None = None  # Store the formatted input prompt
+        self.error_signal: float | None = None  # Placeholder for error signals during execution
         self._parents: list["LLMCall"] = []
         self._op: str | None = None
         self._children: list["LLMCall"] = []
@@ -100,7 +100,9 @@ class LLMCall(Generic[P, R]):
         elif self._op == "*":
             # Intersection for lists
             if all(isinstance(parent.output, list) for parent in self._parents):
-                self.output = list(set(self._parents[0].output) & set(self._parents[1].output))
+                self.output = list(
+                    set(self._parents[0].output) & set(self._parents[1].output)
+                )
             else:
                 raise TypeError("Multiplication is only defined for list outputs.")
         elif self._op == "-":
@@ -150,7 +152,6 @@ class LLMCall(Generic[P, R]):
             output_type=self.output_type,
             format_variables=self.format_variables,
             llama_intention=self.llama_intention,
-            text_chunker=self.text_chunker,
         )
         combined._parents = [self, other]
         combined._op = op
@@ -195,15 +196,31 @@ class LLMCall(Generic[P, R]):
 
     def backward(self, error_signal: Any = None):
         """Backpropagation logic to adjust based on error signals."""
-        logger.info(f"Backpropagating through {self._op} operation, error_signal: {error_signal}")
+        logger.info(
+            f"Backpropagating through {self._op} operation, error_signal: {error_signal}"
+        )
 
         if error_signal is None:
             error_signal = self.evaluate_output()
 
-        # Basic error signal handling: Re-execute if the error is above a threshold
+        # Use error signal to guide modifications
         if error_signal > 0.5:
-            self.output = self._get_prompt_function()(**self.format_variables)
-            logger.info(f"Re-executed prompt due to high error signal. New output: {self.output}")
+            modifications = self.template_modifier.suggest_modifications(
+                self.output, error_signal
+            )
+            if modifications:
+                # Apply modifications
+                mod_type, mod_kwargs = random.choice(modifications)
+                self.modify_template(mod_type, **mod_kwargs)
+                logger.info(
+                    f"Modified template with: {mod_type} - New template: {self.template}"
+                )
+
+                # Re-execute the prompt with the updated template
+                self.output = self._get_prompt_function()(**self.format_variables)
+                logger.info(
+                    f"Re-executed prompt with updated template. New output: {self.output}"
+                )
 
         # Propagate the error signal to parent nodes
         for parent in self._parents:
@@ -216,32 +233,16 @@ class TemplateModifier:
     def __init__(self, base_template: str):
         self.base_template = base_template
 
-    def suggest_modifications(self) -> list[tuple[str, dict[str, str]]]:
-        """Suggests possible modifications to the template."""
+    def suggest_modifications(self, output: str, error_signal: float) -> List[tuple[str, Dict[str, Any]]]:
+        """Suggests possible modifications to the template based on the output and error signal."""
         modifications = []
 
-        # Example modifications:
-        # 1. Add an instruction
-        modifications.append(
-            (
-                "add_instruction",
-                {"instruction": " Be more concise and factual."},
-            )
-        )
-        modifications.append(
-            (
-                "add_instruction",
-                {"instruction": " Use simple and direct language."},
-            )
-        )
-
-        # 2. Replace a keyword (example)
-        modifications.append(
-            (
-                "replace_keyword",
-                {"old_keyword": "{text}", "new_keyword": "{input_text}"},
-            )
-        )
+        if error_signal > 0.7:
+            modifications.append(("add_instruction", {"instruction": " Be more concise."}))
+            modifications.append(("add_instruction", {"instruction": " Focus on key points."}))
+        elif error_signal > 0.5:
+            modifications.append(("add_instruction", {"instruction": " Provide more details."}))
+            modifications.append(("replace_keyword", {"old_keyword": "{text}", "new_keyword": "{input_text}"}))
 
         return modifications
 
@@ -283,8 +284,13 @@ class LlamaIntention:
 
     def calculate_error_signal(self, logprobs: np.ndarray) -> float:
         """Calculates an error signal based on log probabilities."""
-        # This is a placeholder. Replace with your actual error calculation logic.
-        return np.std(logprobs)
+        if not logprobs.size:
+            return 0.0
+        # Calculate the variance of log probabilities as a measure of uncertainty
+        variance = np.var(logprobs)
+        # Example error signal - inverse of variance (higher variance = higher error)
+        error_signal = 1.0 / (1.0 + variance)  # Adding 1 to avoid division by zero
+        return error_signal
 
     def analyze_logprobs(self, text: str, logprobs: np.ndarray) -> Any:
         """Analyzes log probabilities to determine the outcome of the intention."""
@@ -315,7 +321,7 @@ class LlamaIntention:
 async def main():
     # Initialize the LLM
     llm = Llama(
-        model_path="/path/to/your/model.gguf", # Add path to model
+        model_path="/Users/ehaas/Downloads/mistral-7b-v0.2.Q5_K_M.gguf", # Add path to model
         n_ctx=8192,
         n_gpu_layers=17,
         seed=42,
