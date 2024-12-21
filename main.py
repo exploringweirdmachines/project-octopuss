@@ -27,187 +27,350 @@ import re
 import numpy as np
 from pydantic import BaseModel
 from llama_cpp import Llama
-from typing import List, Tuple
-from copy import deepcopy
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 class LLMCall(Generic[P, R]):
-    """Represents a call to an LLM and allows for structural modifications."""
+    """Represents a call to an LLM with a prompt template and functions.
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._is_root = True  # Flag to indicate if this is the starting node
+    This class allows for the chaining of LLM calls using arithmetic operators.
+    """
 
-    def insert_before(self, new_call: "LLMCall") -> "LLMCall":
-        """Inserts a new LLMCall before the current one."""
-        if self._parents:
-            for parent in list(self._parents): # Iterate over a copy
-                parent.remove_child(self)
-                parent.add_child(new_call)
+    def __init__(
+        self,
+        template: str,
+        functions: list[Callable[..., Any]] | None = None,
+        model: ChatModel | None = None,
+        output_type: type[R] | None = None,
+        format_variables: dict[str, Any] | None = None,
+        template_modifiers: list[Callable[[str], str]] | None = None,
+        llama_intention: "LlamaIntention" | None = None, # Add this to class
+    ):
+        self.template = template
+        self.functions = functions or []
+        self.model = model or get_chat_model()
+        self.output_type = output_type or str
+        self.format_variables = format_variables or {}
+        self.output: str | None = None  # Store the output of the LLM call
+        self.input: str | None = None  # Store the formatted input prompt
+        self.error_signal: float | None = None  # Placeholder for error signals during execution
+        self._parents: list["LLMCall"] = []
+        self._op: str | None = None
+        self._children: list["LLMCall"] = []
+        self.version: int = 0
+        self.template_modifiers = template_modifiers or []
+        self.llama_intention = llama_intention
+
+    def _get_prompt_function(self) -> PromptFunction[P, R]:
+        """Create a PromptFunction using the `prompt` decorator."""
+        return prompt(
+            self.template, functions=self.functions, model=self.model, output_type=self.output_type
+        )
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> "LLMCall[P, R]":
+        """Call the LLM with the formatted prompt and arguments."""
+        logger.info(f"Entering __call__ for template: {self.template}, version: {self.version}")
+        self.format_variables.update(kwargs)
+
+        formatted_template = self.template.format(**self.format_variables)
+
+        prompt_function = self._get_prompt_function()
+        self.output = prompt_function(formatted_template, **self.format_variables)
+        self.input = formatted_template
+        return self
+
+    def execute(self) -> Any:
+        """Executes the LLM call and returns the output."""
+        if self.output is None:
+            self.__call__()
+
+        if self._op == "+":
+            # Concatenate outputs of parents
+            self.output = " ".join(str(parent.execute()) for parent in self._parents)
+        elif self._op == "*":
+            # Intersection for lists
+            if all(isinstance(parent.output, list) for parent in self._parents):
+                self.output = list(set(self._parents[0].output) & set(self._parents[1].output))
+            else:
+                raise TypeError("Multiplication is only defined for list outputs.")
+        elif self._op == "-":
+            # Subtraction: Return first parent's output for now
+            self.output = self._parents[0].execute()
+        elif self._op == "/":
+            # Division: Use LlamaIntention to filter concepts
+            if len(self._parents) == 2 and isinstance(self._parents[0].output, str) and isinstance(self._parents[1].output, list):
+                if self.llama_intention:
+                    self.output = self.llama_intention.filter_text_by_concepts(self._parents[0].execute(), self._parents[1].execute())
+                else:
+                    logger.warning("Division operation not defined for current output types or no LlamaIntention provided.")
+            else:
+                raise ValueError("Division operation not defined for current output types or requires LlamaIntention.")
         else:
-            self._is_root = False # No longer the root if inserting before
-            new_call._is_root = True
+            return self.output
 
-        new_call.add_child(self)
-        new_call._op = self._op # Inherit operation if applicable
-        return new_call # Return the new root if this was the root
-
-    def insert_after(self, new_call: "LLMCall") -> None:
-        """Inserts a new LLMCall after the current one."""
-        for child in list(self._children): # Iterate over a copy
-            self.remove_child(child)
-            new_call.add_child(child)
-            new_call._op = child._op # Inherit operation
-
-        self.add_child(new_call)
-        return None
-
-    def replace_with(self, new_call: "LLMCall") -> "LLMCall" :
-        """Replaces the current LLMCall with a new one in the parent's children."""
-        if self._parents:
-            for parent in list(self._parents):
-                parent.remove_child(self)
-                parent.add_child(new_call)
-        else:
-            new_call._is_root = True
-        return new_call if not self._parents else next(iter(self._parents)) # Return the new root or the parent
-
-    def execute_flow(self) -> Any:
-        """Executes the LLMCall and its children recursively."""
-        self.execute()
-        for child in self._children:
-            child.execute_flow() # Or potentially process the output
         return self.output
 
-    def deepcopy(self) -> "LLMCall":
-        """Returns a deep copy of the LLMCall object and its connections."""
-        return deepcopy(self)
+    def __add__(self, other: "LLMCall") -> "LLMCall":
+        return self.combine(other, "+")
 
-    # ... (rest of the LLMCall class remains mostly the same, but ensure deepcopy works correctly)
+    def __sub__(self, other: "LLMCall") -> "LLMCall":
+        return self.combine(other, "-")
 
-def suggest_intelligent_modifications(
-    current_call: LLMCall, error_signal: float, llama_intention: LLamaIntention, text_chunker: TextChunker
-) -> List[LLMCall]:
-    """Suggests intelligent modifications to the LLMCall."""
-    modifications: List[LLMCall] = []
+    def __mul__(self, other: "LLMCall") -> "LLMCall":
+        return self.combine(other, "*")
 
-    # 1. Template Modifications (if error is high)
-    if error_signal > 0.5:
-        modifier = TemplateModifier(current_call.template)
-        for mod_type, mod_kwargs in modifier.suggest_modifications():
-            modified_call = current_call.deepcopy()
-            modified_call.modify_template(mod_type, **mod_kwargs)
-            modifications.append(modified_call)
+    def __truediv__(self, other: "LLMCall") -> "LLMCall":
+        return self.combine(other, "/")
 
-    # 2. Structural Modifications based on LlamaAbstractor
-    if isinstance(current_call.output, str) and llama_intention:
-        abstraction_ranges = llama_intention.execute(current_call.output)
-        for start, end in abstraction_ranges:
-            abstracted_text = current_call.output[start:end]
-            new_call_before = LLMCall(
-                template="Process this abstraction: '{text}'",
-                llama_intention=llama_intention,
-                text_chunker=text_chunker,
-                format_variables={"text": abstracted_text},
+    def combine(self, other: "LLMCall", op: str) -> "LLMCall":
+        combined = LLMCall(
+            template=self.template,
+            functions=self.functions,
+            model=self.model,
+            output_type=self.output_type,
+            format_variables=self.format_variables,
+            llama_intention=self.llama_intention,
+            text_chunker=self.text_chunker,
+        )
+        combined._parents = [self, other]
+        combined._op = op
+
+        self._children.append(combined)
+        if isinstance(other, LLMCall):
+            other._children.append(combined)
+
+        return combined
+
+    def _filter_text_by_concepts(self, text: str, concepts: List[str]) -> str:
+        """Filters text based on the presence of given concepts."""
+        filtered_text = []
+        for sentence in text.split("."):
+            sentence = sentence.strip()
+            if any(concept.lower() in sentence.lower() for concept in concepts):
+                filtered_text.append(sentence)
+        return ". ".join(filtered_text)
+
+    def update_template(self, new_template: str):
+        """Updates the template and increments the version."""
+        self.template = new_template
+        self.version += 1
+
+    def modify_template(self, modification_type: str, **kwargs):
+        """Modifies the template based on the modification type."""
+        if modification_type == "add_instruction":
+            self.template += " " + kwargs["instruction"]
+        elif modification_type == "replace_keyword":
+            self.template = self.template.replace(
+                kwargs["old_keyword"], kwargs["new_keyword"]
             )
-            modified_call_insert_before = current_call.deepcopy()
-            inserted_root = modified_call_insert_before.insert_before(new_call_before)
-            modifications.append(inserted_root)
+        # Add more modification types as needed
+        self.version += 1
 
-            new_call_after = LLMCall(
-                template="Further process: '{text}'",
-                llama_intention=llama_intention,
-                text_chunker=text_chunker,
-                format_variables={"text": current_call.output},
+    def evaluate_output(self) -> float:
+        """Placeholder for evaluating the output and returning an error signal."""
+        # Implement your evaluation logic here
+        # This could be based on external feedback, internal consistency checks, etc.
+        # For now, we just return a random error signal
+        return random.uniform(0, 1)
+
+    def backward(self, error_signal: Any = None):
+        """Backpropagation logic to adjust based on error signals."""
+        logger.info(f"Backpropagating through {self._op} operation, error_signal: {error_signal}")
+
+        if error_signal is None:
+            error_signal = self.evaluate_output()
+
+        if self._op:
+            if self._op == "+":
+                if error_signal > 0.5:
+                    # Re-execute the prompt with an updated template
+                    self.update_template(self.template + " Be more concise and factual.")
+                    self.output = self._get_prompt_function()(**self.format_variables)
+                    logger.info(f"Re-executed prompt with updated template. New output: {self.output}")
+
+            elif self._op == "/":
+                if error_signal > 0.5:
+                    if len(self._parents) == 2:
+                        numerator_output = self._parents[0].execute()
+                        denominator_output = self._parents[1].execute()
+
+                        if isinstance(numerator_output, str) and isinstance(denominator_output, list):
+                            filtered_output = self._filter_text_by_concepts(numerator_output, denominator_output)
+                            self.output = filtered_output
+                            logger.info(f"Filtered output based on concepts. New output: {self.output}")
+                        else:
+                            logger.warning("Division operation not defined for current output types.")
+
+        # Propagate the error signal to parent nodes
+        for parent in self._parents:
+            parent.backward(error_signal)
+
+    def __repr__(self) -> str:
+        return f"<LLMCall - Output: {self.output}>"
+
+class TemplateModifier:
+    def __init__(self, base_template: str):
+        self.base_template = base_template
+
+    def suggest_modifications(self) -> list[tuple[str, dict[str, str]]]:
+        """Suggests possible modifications to the template."""
+        modifications = []
+
+        # Example modifications:
+        # 1. Add an instruction
+        modifications.append(
+            (
+                "add_instruction",
+                {"instruction": " Be more concise and factual."},
             )
-            modified_call_insert_after = current_call.deepcopy()
-            modified_call_insert_after.insert_after(new_call_after)
-            modifications.append(modified_call_insert_after.deepcopy()) # Ensure the modified structure is captured
+        )
+        modifications.append(
+            (
+                "add_instruction",
+                {"instruction": " Use simple and direct language."},
+            )
+        )
 
-    # 3. Consider replacing the current call (radical reflection)
-    replacement_call = LLMCall(
-        template="Let's try a different approach: {text}",
-        llama_intention=llama_intention,
-        text_chunker=text_chunker,
-        format_variables=current_call.format_variables,
-    )
-    modified_call_replace = current_call.deepcopy()
-    replaced_root = modified_call_replace.replace_with(replacement_call)
-    modifications.append(replaced_root)
+        # 2. Replace a keyword (example)
+        modifications.append(
+            (
+                "replace_keyword",
+                {"old_keyword": "{text}", "new_keyword": "{input_text}"},
+            )
+        )
 
-    return modifications
+        return modifications
+
+    def apply_modification(
+        self, template: str, modification_type: str, **kwargs: Any
+    ) -> str:
+        """Applies a given modification to the template."""
+        if modification_type == "add_instruction":
+            return template + kwargs["instruction"]
+        elif modification_type == "replace_keyword":
+            return template.replace(kwargs["old_keyword"], kwargs["new_keyword"])
+        else:
+            raise ValueError(f"Unknown modification type: {modification_type}")
+
+class LlamaIntention:
+    def __init__(self, llm_model: Any):  # Replace 'Any' with your LLM model type
+        self.llm = llm_model
+
+    def format_prompt(self, text: str) -> str:
+        # Basic example: You'll need to adapt this to your specific needs
+        return f"Analyze the following text: {text}"
+
+    def get_target_token_id(self) -> int:
+        return self.llm.tokenize(b" ")[0]
+
+    def get_logprobs(self, text: str) -> np.ndarray:
+        prompt = self.format_prompt(text)
+        input_tokens = self.llm.tokenize(prompt.encode("utf-8"), add_bos=True)
+        self.llm.eval(input_tokens)
+
+        target_token_id = self.get_target_token_id()
+        logprobs = []
+        for i in range(len(input_tokens)):
+            scores = self.llm.scores[i]
+            probs = np.exp(scores) / np.exp(scores).sum()  # Softmax
+            logprobs.append(np.log(probs[target_token_id]))
+
+        return np.array(logprobs)
+
+    def calculate_error_signal(self, logprobs: np.ndarray) -> float:
+        """Calculates an error signal based on log probabilities."""
+        # This is a placeholder. Replace with your actual error calculation logic.
+        return np.std(logprobs)
+
+    def analyze_logprobs(self, text: str, logprobs: np.ndarray) -> Any:
+        """Analyzes log probabilities to determine the outcome of the intention."""
+        # Placeholder for more sophisticated analysis
+        avg_logprob = np.mean(logprobs)
+        boundaries = [i for i, lp in enumerate(logprobs) if lp < avg_logprob - 0.5]
+        return boundaries
+
+    def execute(self, text: str) -> Any:
+        if not text.strip():
+            return self.handle_empty_input()
+
+        logprobs = self.get_logprobs(text)
+        return self.analyze_logprobs(text, logprobs)
+
+    def handle_empty_input(self) -> Any:
+        return None
+
+    def filter_text_by_concepts(self, text: str, concepts: List[str]) -> str:
+        """Filters text based on the presence of given concepts."""
+        filtered_text = []
+        for sentence in text.split("."):
+            sentence = sentence.strip()
+            if any(concept.lower() in sentence.lower() for concept in concepts):
+                filtered_text.append(sentence)
+        return ". ".join(filtered_text)
 
 async def main():
-    # Initialize the LLM, LlamaIntention, and TextChunker
+    # Initialize the LLM
     llm = Llama(
-        model_path="/path/to/your/model.gguf",  # Add path to model
+        model_path="/path/to/your/model.gguf", # Add path to model
         n_ctx=8192,
         n_gpu_layers=17,
         seed=42,
     )
-    llama_intention = LLamaIntention(llm)
-    text_chunker = TextChunker(global_threshold=0.6, relative_threshold=0.2)
-    text_chunker.train(["This is a sentence. This is another one.", "Short text."])
 
-    # Initialize the root LLM call
-    llm_call1 = LLMCall(
-        template="Translate '{text}' to French.",
-        llama_intention=llama_intention,
-        text_chunker=text_chunker,
-        format_variables={"text": "{input_text}"}
-    )
-    llm_call2 = LLMCall(
-        template="Summarize this text: {text}.",
-        llama_intention=llama_intention,
-        text_chunker=text_chunker,
-        format_variables={"text": "{input_text}"}
-    )
-    llm_call3 = LLMCall(
-        template="What is the sentiment of this text: {text}?",
-        llama_intention=llama_intention,
-        text_chunker=text_chunker,
-        format_variables={"text": "{input_text}"}
-    )
+    # Initialize LlamaIntention with the model
+    llama_intention = LlamaIntention(llm)
 
-    initial_call = llm_call1 + llm_call2 / llm_call3 # Example initial program
+    # Initialize the LLM calls with LlamaIntention
+    llm_call1 = LLMCall("Translate '{text}' to French.", llama_intention=llama_intention)
+    llm_call2 = LLMCall("Summarize this text: {text}.", llama_intention=llama_intention)
+    llm_call3 = LLMCall("What is the sentiment of this text: {text}?", llama_intention=llama_intention)
 
-    beam_size = 3
-    active_beams = [initial_call]  # Start with the initial program
+    # Combine LLM calls using arithmetic operators
+    # Example of using the division operator
+    combined_call = (llm_call1 + llm_call2) / llm_call3
 
+    # Initial input
     input_text = "This is a test. This is more text to test the chunker. And even more."
 
-    for iteration in range(3):  # Limit iterations for demonstration
+    # Create a template modifier
+    modifier = TemplateModifier(llm_call1.template)
+
+    # Main loop
+    for iteration in range(3):  # Increased number of iterations
         print(f"Iteration {iteration + 1}")
-        next_beams = []
 
-        for current_program_root in active_beams:
-            # Execute the current program
-            result_root = current_program_root.deepcopy() # Execute on a copy
-            result_root(input_text=input_text).execute_flow() # Execute with input
-            error_signal = result_root.evaluate_output() # Evaluate the output of the root
-            print(f"Beam Program Output: {result_root.output}, Error: {error_signal:.2f}")
+        # Execute the combined call with specific inputs
+        result = combined_call(
+            text=input_text,
+            summary="Provide a concise summary.",
+            sentiment="Positive",
+        )
+        result.execute()
 
-            # Suggest modifications
-            modifications = suggest_intelligent_modifications(
-                result_root, error_signal, llama_intention, text_chunker
+        print(f"Output: {result.output}")
+
+        # Get an error signal from LlamaIntention
+        error_signal = combined_call.evaluate_output()
+        print(f"Error Signal: {error_signal:.2f}")
+
+        # Perform backpropagation
+        combined_call.backward(error_signal)
+
+        # Randomly suggest and apply modifications
+        if error_signal > 0.5:
+            modifications = modifier.suggest_modifications()
+            mod_type, mod_kwargs = random.choice(modifications)
+
+            # Randomly pick a call to modify
+            call_to_modify = random.choice([llm_call1, llm_call2, llm_call3])
+
+            call_to_modify.modify_template(mod_type, **mod_kwargs)
+            print(
+                f"Modified template of {call_to_modify} with: {mod_type} - New template: {call_to_modify.template}"
             )
-            next_beams.extend(modifications)
-
-        # Prune the beam
-        next_beams.sort(key=lambda call: call.evaluate_output() if call.output is not None else float('inf')) # Lower error is better
-        active_beams = next_beams[:beam_size]
-
-        if not active_beams:
-            break
-
-    if active_beams:
-        best_program = active_beams[0]
-        print(f"Best Program Output after search: {best_program.output}")
-    else:
-        print("No promising programs found.")
 
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(main())
