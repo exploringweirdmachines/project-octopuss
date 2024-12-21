@@ -1,6 +1,7 @@
-from typing import Any, Callable, Generic, ParamSpec, Protocol, TypeVar, cast, overload
-import random
-import re
+import inspect
+from collections.abc import Awaitable, Callable, Sequence
+from functools import update_wrapper
+from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, overload
 
 from magentic.backend import get_chat_model
 from magentic.chat_model.base import ChatModel
@@ -21,10 +22,24 @@ from magentic.logger import logger
 from magentic.prompt_function import BasePromptFunction, AsyncPromptFunction, PromptFunction
 from magentic.streaming import async_iter, azip
 
+import random
+import re
+import numpy as np
+from pydantic import BaseModel
+
 P = ParamSpec("P")
+# TODO: Make `R` type Union of all possible return types except FunctionCall ?
+# Then `R | FunctionCall[FuncR]` will separate FunctionCall from other return types.
+# Can then use `FuncR` to make typechecker check `functions` argument to `prompt`
+# `Not` type would solve this - https://github.com/python/typing/issues/801
 R = TypeVar("R")
 
 class LLMCall(Generic[P, R]):
+    """Represents a call to an LLM with a prompt template and functions.
+
+    This class allows for the chaining of LLM calls using arithmetic operators.
+    """
+
     def __init__(
         self,
         template: str,
@@ -39,9 +54,9 @@ class LLMCall(Generic[P, R]):
         self.model = model or get_chat_model()
         self.output_type = output_type or str
         self.format_variables = format_variables or {}
-        self.output: str | None = None
-        self.input: str | None = None
-        self.error_signal: float | None = None
+        self.output: str | None = None  # Store the output of the LLM call
+        self.input: str | None = None  # Store the formatted input prompt
+        self.error_signal: float | None = None  # Placeholder for error signals during execution
         self._parents: list[LLMCall] = []
         self._op: str | None = None
         self._children: list[LLMCall] = []
@@ -56,8 +71,13 @@ class LLMCall(Generic[P, R]):
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> "LLMCall[P, R]":
         """Call the LLM with the formatted prompt and arguments."""
+        # Update format variables with the new arguments
         self.format_variables.update(kwargs)
+
+        # Format the template string with the current format variables
         formatted_template = self.template.format(**self.format_variables)
+
+        # Create a prompt function with the formatted template and call it
         prompt_function = self._get_prompt_function()
         self.output = prompt_function(formatted_template, **self.format_variables)
         self.input = formatted_template
@@ -69,20 +89,24 @@ class LLMCall(Generic[P, R]):
             self.__call__()
 
         if self._op == "+":
+            # Concatenate outputs of parents
             self.output = " ".join(str(parent.execute()) for parent in self._parents)
         elif self._op == "*":
+            # Intersection for lists
             if all(isinstance(parent.output, list) for parent in self._parents):
                 self.output = list(set(self._parents[0].output) & set(self._parents[1].output))
             else:
                 raise TypeError("Multiplication is only defined for list outputs.")
         elif self._op == "-":
+            # Subtraction: Return first parent's output for now
             self.output = self._parents[0].execute()
         elif self._op == "/":
-            if len(self._parents) == 2 and isinstance(self._parents[0].output, str) and isinstance(self._parents[1].output, list):
-                self.output = self._filter_text_by_concepts(self._parents[0].execute(), self._parents[1].execute())
-            else:
-                raise ValueError("Division operation not defined for current output types.")
-        
+            # Division: Implement your logic here
+            # For now, just return the first parent's output as a placeholder
+            self.output = self._parents[0].execute()
+        else:
+            return self.output
+
         return self.output
 
     def __add__(self, other: "LLMCall") -> "LLMCall":
@@ -144,20 +168,30 @@ class LLMCall(Generic[P, R]):
 
     def backward(self, error_signal: Any = None):
         """Backpropagation logic to adjust based on error signals."""
-        logger.info(
-            f"Backpropagating through {self._op} operation, error_signal: {error_signal}"
-        )
+        logger.info(f"Backpropagating through {self._op} operation, error_signal: {error_signal}")
 
         if error_signal is None:
             error_signal = self.evaluate_output()
 
-        if error_signal > 0.5:
-            # Example modification: add an instruction to be more concise
-            self.modify_template("add_instruction", instruction="Be more concise.")
-            self.output = self._get_prompt_function()(**self.format_variables)
-            logger.info(
-                f"Re-executed prompt with updated template. New output: {self.output}"
-            )
+        if self._op:
+            if self._op == "+":
+                if error_signal > 0.5:
+                    self.update_template(self.template + " Be more concise and factual.")
+                    self.output = self._get_prompt_function()(**self.format_variables)
+                    logger.info(f"Re-executed prompt with updated template. New output: {self.output}")
+
+            elif self._op == "/":
+                if error_signal > 0.5:
+                    if len(self._parents) == 2:
+                        numerator_output = self._parents[0].execute()
+                        denominator_output = self._parents[1].execute()
+
+                        if isinstance(numerator_output, str) and isinstance(denominator_output, list):
+                            filtered_output = self._filter_text_by_concepts(numerator_output, denominator_output)
+                            self.output = filtered_output
+                            logger.info(f"Filtered output based on concepts. New output: {self.output}")
+                        else:
+                            logger.warning("Division operation not defined for current output types.")
 
         for parent in self._parents:
             parent.backward(error_signal)
@@ -209,37 +243,54 @@ class TemplateModifier:
         else:
             raise ValueError(f"Unknown modification type: {modification_type}")
 
-# Example Usage:
-template = "Translate '{text}' to French."
-llm_call = LLMCall(template)
-
-modifier = TemplateModifier(template)
-modifications = modifier.suggest_modifications()
-
-for mod_type, mod_args in modifications:
-    new_template = modifier.apply_modification(template, mod_type, **mod_args)
-    print(f"Modified template ({mod_type}): {new_template}")
-
-def main():
+# Example usage with asyncio
+async def main():
     # Initialize the LLM and the first prompt template
-    llm_call = LLMCall("Translate '{text}' to French.")
+    llm_call1 = LLMCall("Translate '{text}' to French.")
+    llm_call2 = LLMCall("Summarize this text: {text}.")
+    llm_call3 = LLMCall("What is the sentiment of this text: {text}?")
+
+    # Combine LLM calls using arithmetic operators
+    combined_call = (llm_call1 + llm_call2) * llm_call3
 
     # Initial input
     input_text = "This is a test."
 
-    # Main loop
-    for _ in range(3):  # Run for a few iterations
-        # Execute the LLM call
-        llm_call(text=input_text)
-        llm_call.execute()
+    # Create a template modifier
+    modifier = TemplateModifier(llm_call1.template)
 
-        # Get an error signal (replace with your actual error calculation)
-        error_signal = llm_call.evaluate_output()
+    # Main loop
+    for iteration in range(3):
+        print(f"Iteration {iteration + 1}")
+
+        # Execute the combined call with specific inputs
+        result = combined_call(
+            text=input_text,
+            summary="Provide a concise summary.",
+            sentiment="Positive",
+        )
+        result.execute()
+
+        print(f"Output: {result.output}")
+
+        # Simulate an error signal based on the output or further downstream tasks
+        error_signal = random.uniform(0, 1)
 
         # Perform backpropagation
-        llm_call.backward(error_signal)
+        combined_call.backward(error_signal)
 
-        print(f"Output: {llm_call.output}, Error: {error_signal:.2f}, Template Version: {llm_call.version}")
+        # Randomly suggest and apply modifications
+        if error_signal > 0.5:
+            modifications = modifier.suggest_modifications()
+            mod_type, mod_kwargs = random.choice(modifications)
+
+            # Randomly pick a call to modify
+            call_to_modify = random.choice([llm_call1, llm_call2, llm_call3])
+
+            call_to_modify.modify_template(mod_type, **mod_kwargs)
+            print(f"Modified template of {call_to_modify} with: {mod_type} - New template: {call_to_modify.template}")
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+
+    asyncio.run(main())
