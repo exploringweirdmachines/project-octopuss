@@ -71,7 +71,7 @@ High-Level Algorithmic Flow
         Move on to more complex tasks, or bigger program sizes.
         Over time, the system accumulates a growing library of partial solutions and trains the guide to better handle the combinatorial explosion of possibilities.
 
-
+```markdown
  ┌─────────────────────────────────────────────┐
  │ Outer Loop (Symbolic + Reflective Search) │
  │                                           │
@@ -102,3 +102,4 @@ High-Level Algorithmic Flow
        │ (Differentiable gating,    │
        │  partial execution steps)   │
        └─────────────────────────────┘
+```
